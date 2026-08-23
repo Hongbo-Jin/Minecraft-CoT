@@ -33,7 +33,7 @@ contribution is the `trl_sft/` training pipeline described below.
 First install the OpenHA base, which provides `minestudio`, `openagents`, `vllm`, etc.:
 
 ```sh
-git clone --recurse-submodules https://github.com/Hongbo-Jin/Minecraft-CoT.git
+git clone --recurse-submodules https://github.com/AxiomJin/Minecraft-CoT.git
 conda create -n minecraft-cot python=3.10
 conda activate minecraft-cot
 pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
@@ -143,7 +143,7 @@ If you use Minecraft-CoT in your work, please cite:
 @misc{minecraft-cot,
   title        = {Minecraft-CoT: Multi-Stage SFT for Minecraft Vision-Language Agents},
   author       = {Jin, Hongbo},
-  howpublished = {\url{https://github.com/Hongbo-Jin/Minecraft-CoT}},
+  howpublished = {\url{https://github.com/AxiomJin/Minecraft-CoT}},
   year         = {2025}
 }
 ```
