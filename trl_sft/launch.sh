@@ -3,9 +3,9 @@
 # TRL SFT training launch script for Minecraft VLM.
 #
 # Usage:
-#   bash launch.sh debug                       # quick 1-GPU smoke test
-#   bash launch.sh train --nproc 8              # Stage I/II, single node
-#   bash launch.sh stage3 --nproc 8              # Stage III, full-trajectory multi-step loss
+#   bash launch.sh stage1 --nproc 8             # Stage I, text-only + frozen vision tower
+#   bash launch.sh train --nproc 8              # Stage II, jsonl VQA/caption/grounding
+#   bash launch.sh stage3 --nproc 8             # Stage III, full-trajectory multi-step loss
 #   NNODES=2 NODE_RANK=0 MASTER_ADDR=10.0.0.1 bash launch.sh train   # multi-node, node 0
 #
 # Every mode self-bootstraps its Python env (see `bootstrap_env`) and localizes S3 data
@@ -32,7 +32,7 @@ ATTN_IMPL="${ATTN_IMPL:-sdpa}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        train|debug|stage3) MODE="$1"; shift ;;
+        stage1|train|stage3) MODE="$1"; shift ;;
         --mode) MODE="$2"; shift 2 ;;
         --nproc) NPROC="$2"; shift 2 ;;
         --nnodes) NNODES="$2"; shift 2 ;;
@@ -167,19 +167,33 @@ localize_stage3_parquet_dataset() {
 }
 
 case "$MODE" in
-    debug)
-        echo "=== Running DEBUG dry-run ==="
+    stage1)
+        echo "=== Stage I training: NNODES=$NNODES NODE_RANK=$NODE_RANK NPROC=$NPROC ==="
         bootstrap_env
-        localize_stage2_jsonl_and_images
-        python3 train_sft.py \
-            --model_path "$MODEL_PATH" \
-            --data_path "$DATA_PATH" \
-            --data_format jsonl \
-            --image_root "$IMAGE_ROOT" \
-            --download_model "$DOWNLOAD_CACHE" \
-            --attn_implementation "$ATTN_IMPL" \
-            --max_turns 2 \
-            --debug
+                echo "MODEL_PATH=$MODEL_PATH OUTPUT_DIR=$OUTPUT_DIR MAX_STEPS=$MAX_STEPS TOTAL_GPUS=$TOTAL_GPUS"
+        torchrun \
+            --nnodes="$NNODES" --nproc_per_node="$NPROC" --node_rank="$NODE_RANK" \
+            --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT" \
+            train_sft.py \
+                --model_path "$MODEL_PATH" \
+                --data_path "$DATA_PATH" \
+                --data_format jsonl --text_only --freeze_vision_tower \
+                --image_root "$IMAGE_ROOT" \
+                --download_model "$DOWNLOAD_CACHE" \
+                --output_dir "$OUTPUT_DIR" \
+                --resume_from_checkpoint auto \
+                --attn_implementation "$ATTN_IMPL" \
+                --max_seq_length "$MAX_SEQ_LENGTH" \
+                --per_device_batch_size "$PER_DEVICE_BATCH_SIZE" \
+                --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
+                --gradient_checkpointing \
+                --dataloader_num_workers "$DATALOADER_NUM_WORKERS" \
+                --num_train_epochs 1 \
+                --max_steps "$MAX_STEPS" \
+                --learning_rate 8e-6 \
+                --deepspeed ds_zero1.json \
+                --save_steps 999 \
+                --logging_steps 10
         ;;
     train)
         echo "=== Stage I/II training: NNODES=$NNODES NODE_RANK=$NODE_RANK NPROC=$NPROC ==="
@@ -248,7 +262,15 @@ case "$MODE" in
             --logging_steps 10
         ;;
     *)
-        echo "Usage: bash launch.sh [debug|train|stage3]"
+        echo "Usage: bash launch.sh [stage1|train|stage3] [--nproc N] [--nnodes N] [--master-addr A] [--master-port P]"
+        echo ""
+        echo "Modes:"
+        echo "  stage1  Text-only SFT, freeze vision tower (Stage I)"
+        echo "  train   VLM SFT on jsonl VQA/caption/grounding (Stage II)"
+        echo "  stage3  Full-trajectory multi-step loss on parquet (Stage III)"
+        echo ""
+        echo "Key env vars (override with --env KEY=VAL or export):"
+        echo "  MODEL_PATH, DATA_PATH, OUTPUT_DIR, MAX_STEPS, PER_DEVICE_BATCH_SIZE"
         exit 1
         ;;
 esac

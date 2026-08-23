@@ -1,159 +1,149 @@
-# <center> OpenHA: A Series of Open-Source Hierarchical Agentic Models in Minecraft</center>
+# Minecraft-CoT
 
-<div align="center">
-    <a href="https://craftjarvis.github.io/"><img alt="Homepage" src="https://img.shields.io/badge/%20CraftJarvis-HomePage-ffc107?color=blue&logoColor=white"/></a>
-    <a href="https://huggingface.co/CraftJarvis"><img alt="Hugging Face" src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-CraftJarvis-ffc107?color=3b65ab&logoColor=white"/></a>
-    <a href="https://github.com/CraftJarvis/OpenHA/blob/master/LICENSE"><img src="https://img.shields.io/badge/Code License-MIT-blue"/></a>
-</div>
+**Multi-stage supervised fine-tuning (SFT) pipeline for Minecraft vision-language / chain-of-thought agents.**
 
-<div align="center">	
-    <a href="https://arxiv.org/abs/2509.13347"><img src="https://img.shields.io/badge/arXiv-2509.13347-b31b1b.svg"></a>
-    <a href="https://huggingface.co/collections/CraftJarvis/openha-68c5248493fc6672b3ccaa29"><img src="https://img.shields.io/badge/Model-Released-green"/></a>
-    <a href="https://huggingface.co/collections/CraftJarvis/openha-68c5248493fc6672b3ccaa29"><img src="https://img.shields.io/badge/Dataset-Released-orange"/></a>
-    <a href="https://github.com/CraftJarvis/OpenHA"><img src="https://visitor-badge.laobi.icu/badge?page_id=CraftJarvis.OpenHA"/></a>
-    <a href="https://github.com/CraftJarvis/OpenHA"><img src="https://img.shields.io/github/stars/CraftJarvis/OpenHA"/></a>
-</div>
+This repository trains Minecraft vision-language models (VLMs) that reason over game
+frames and emit structured actions (and, in the full-trajectory stage, multi-step
+chain-of-thought). It is built on top of the
+[OpenHA](https://github.com/CraftJarvis/OpenHA) infrastructure: the Minecraft
+environment, agent rollout, and grounding (SAM2) support come from the vendored
+`openagents/`, `CrossAgent/`, and `external/` directories, while our primary
+contribution is the `trl_sft/` training pipeline described below.
 
-![framework](./openagents/assets/doc/framework.pdf)
+> The original OpenHA documentation is preserved at [`README_OpenHA.md`](./README_OpenHA.md)
+> for reference (install steps, vLLM inference, output modes).
 
 ---
 
-## ⭐️ Updates
-- **[2025.12] Released our paper: "[Training One Model to Master Cross-Level Agentic Actions via Reinforcement Learning](https://arxiv.org/abs/2512.09706)". We also released the related code in the `CrossAgent` folder.**
-- **[2025.09] Released our paper: "[OpenHA: A Series of Open-Source Hierarchical Agentic Models in Minecraft](https://arxiv.org/abs/2509.13347)".**
-- **[2025.09] Released the codebase.**
+## Repository layout
+
+| Path | Description | Origin |
+|------|-------------|--------|
+| `trl_sft/` | **Our SFT training pipeline** (Stage I / II / III) for Minecraft text-action VLMs. | Ours |
+| `openagents/` | Minecraft agent framework, vLLM rollout client, system prompts. | Vendored (OpenHA) |
+| `examples/` | Rollout / evaluation scripts (e.g. `rollout_openha.py`). | Vendored (OpenHA) |
+| `scripts/` | Launch helpers for OpenHA inference. | Vendored (OpenHA) |
+| `CrossAgent/` | Cross-level reinforcement-learning training code. | Vendored (OpenHA) |
+| `external/` | External dependencies (modified SAM2 for grounding). | Vendored (OpenHA) |
 
 ---
 
-## 🎈 Getting Started
+## Installation
 
-### 🔧 Installation
-Clone repo and install dependencies:
+First install the OpenHA base, which provides `minestudio`, `openagents`, `vllm`, etc.:
 
 ```sh
-git clone --recurse-submodules https://github.com/CraftJarvis/OpenHA.git
-conda create -n openha python=3.10
-conda activate openha
-pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124  # check your CUDA version
-cd OpenHA
+git clone --recurse-submodules https://github.com/Hongbo-Jin/Minecraft-CoT.git
+conda create -n minecraft-cot python=3.10
+conda activate minecraft-cot
+pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 conda install --channel=conda-forge openjdk=8 -y
 pip install -e .
 ```
 
-> ⚠️ Note: The script will install **minestudio** automatically. If you have not used MineStudio before, please check [the tutorial](https://craftjarvis.github.io/MineStudio/overview/getting-started.html).
-
-For grounding-HA integration with [ROCKET-1](), you need a slightly modified **SAM2**:
-```sh
-cd external/SAM2
-pip install -e .
-```
-
----
-
-### 🚀 Inference
-OpenHA supports multiple ways to serve and load models.  
-We recommend **vLLM** for efficient multi-GPU / multi-process rollout. Example:
+Then install the SFT training dependencies:
 
 ```sh
-CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve CraftJarvis/minecraft-openha-qwen2vl-7b-2509  \
-    --served-model-name minecraft-openha-qwen2vl-7b-2509  \
-    --port 11000 \
-    --limit-mm-per-prompt image=25  \
-    --trust-remote-code --gpu-memory-utilization 0.90  \
-    --pipeline-parallel-size 1  \
-    --tensor-parallel-size 4  \
-    --max-num-seqs 16 \
-    --max-logprobs 20 \
-    --max-model-len 32768
+cd trl_sft
+pip install -r requirements.txt
+# optional, faster attention backend (compiled wheel needs packaging + ninja + psutil):
+pip install flash-attn==2.7.4.post1
 ```
 
-Once the model is loaded, run rollout:
+---
+
+## SFT Training (`trl_sft/`)
+
+`trl_sft/train_sft.py` is a [TRL](https://github.com/huggingface/trl) `SFTTrainer`-based
+trainer for vision-language models. It supports two data layouts:
+
+- **jsonl flat QA** (e.g. `minecraft-vlp`): prompt/completion form; loss is applied only
+  to the final `"Action: ..."` assistant turn.
+- **parquet trajectories** (e.g. `minecraft-text-action-dataset`): full-trajectory
+  multi-step loss via `--full_trajectory`, training on *every* assistant turn across the
+  whole episode (this is where chain-of-thought / multi-step reasoning is learned).
+
+### Three-stage curriculum
+
+| Stage | Data | Key flags | DeepSpeed | Notes |
+|-------|------|-----------|-----------|-------|
+| **Stage I** | text-only QA (`mc-qa-*.jsonl`) | `--text_only --freeze_vision_tower` | `ds_zero1.json` | World-knowledge post-training; ViT + adapter frozen |
+| **Stage II** | jsonl VLM (`mc-vqa`, `mc-caption`, `mc-grounding-*`) | `--data_format jsonl --max_turns 4` | `ds_zero2.json` | Vision-language SFT on image + text |
+| **Stage III** | parquet full trajectories (`minecraft-text-action-dataset`) | `--data_format parquet --full_trajectory` | `ds_zero2_no_offload.json` | Multi-step loss over whole trajectories |
+
+### Supported backbones & data
+
+- **Models**: Qwen2-VL, Qwen2.5-VL, Qwen3-VL, and Qwen3.5 VLMs (e.g. `Qwen2-VL-7B-Instruct`,
+  `Qwen3.5-9B`). Weights and datasets live on S3 under `s3://arcwm-code-us-west-2/axiom/...`.
+- **Datasets**: `minecraft-vlp` (jsonl: `mc-qa`, `mc-vqa`, `mc-caption`, `mc-grounding-*`)
+  and `minecraft-text-action-dataset` (parquet full-trajectory episodes).
+
+### Running
+
+Each stage has a ready-to-run launcher that handles environment bootstrap, S3 data
+localization (to local NVMe for throughput), and the DeepSpeed / `torchrun` launch:
 
 ```sh
-python examples/rollout_openha.py --output_mode text_action  \
-    --vlm_client_mode online \
-    --system_message_tag text_action \
-    --model_ips localhost --model_ports 11000 \
-    --model_id minecraft-openha-qwen2vl-7b-2509 \
-    --record_path "/DATA/limuyao/evaluate" \
-    --max_steps_num 200 \
-    --num_rollouts 8
+# Stage I — text-only, freezes the vision tower
+bash train_stage1.sh --nproc 8
+
+# Stage II — jsonl vision-language SFT
+bash train_stage2.sh --nproc 8
+
+# Stage III — full-trajectory parquet (requires a Stage II checkpoint)
+MODEL_PATH=s3://.../stage2-qwen35-9b  bash train_stage3.sh --nproc 8
+
+# Use the Flash-Attention 2 backend:
+bash train_stage2.sh --nproc 8 --attn-impl flash_attention_2
 ```
 
-OpenHA also supports HuggingFace Transformers (`hf`) or offline `vllm` loading.  
-Just change the `--vlm_client_mode` argument accordingly.
+**Common overrides** (environment variables): `MODEL_PATH`, `DATA_PATH`, `OUTPUT_DIR`,
+`MAX_STEPS`, `PER_DEVICE_BATCH_SIZE`, `GRADIENT_ACCUMULATION_STEPS`, `MAX_SEQ_LENGTH`,
+`DATALOADER_NUM_WORKERS`. `train_stage2.sh` derives `MAX_STEPS` from the dataset size and
+the effective batch size automatically.
+
+**W&B**: metrics are logged automatically whenever `WANDB_API_KEY` is set. For local runs,
+copy `trl_sft/.env.wandb.example` to `trl_sft/.env.wandb` and fill in the key (the launcher
+sources it). For remote koala jobs, export `WANDB_API_KEY` in the submit command instead.
+Override the dashboard run name with `WANDB_RUN_NAME` (each stage script also sets a
+sensible default).
+
+The single-file `trl_sft/launch.sh` contains the same three stages behind a `MODE`
+argument for reference.
+
+### Remote (koala) submission
+
+The scripts target multi-GPU nodes (DeepSpeed ZeRO). Submit via koala, exporting
+`WANDB_API_KEY` and using the relevant `train_stage*.sh` as the entry command.
 
 ---
 
-## 🎮 Interaction Details
+## Inference / Rollout
 
-You can control the **output format** of OpenHA via `system_message_tag` in `rollout_openha.py`.
-
-| Parameter          | Output Example                                                                                                       | System Prompt                                                                 |
-|--------------------|-----------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------|
-| `text_action`      | `Action: move(dx='4.0', dy='-1.0') and keyDown(keys=(keyboard.left.control, keyboard.w))`                            | [text_action.txt](./openagents/assets/system_prompt/text_action.txt)                      |
-| `grounding_action` | `Grounding: move_camera <\|object_ref_start\|>empty slot<\|object_ref_end\|><\|point_start\|>(881,558)<\|point_end\|>` | [grounding.txt](./openagents/assets/system_prompt/grounding.txt)                          |
-| `motion_action`    | `Motion: cursor move left and down`                                                                                  | [motion.txt](./openagents/assets/system_prompt/motion.txt)                                |
-| `grounding_coa`    | `Grounding: ... (615,505)... \n, Action: move(19, 0) and press()`                                                    | [grounding_coa.txt](./openagents/assets/system_prompt/grounding_coa.txt)                  |
-| `motion_coa`       | `Motion: cursor move right and up \n, Action: move(17, 0) and press()`                                               | [motion_coa.txt](./openagents/assets/system_prompt/motion_coa.txt)                        |
-
-Corresponding `output_mode` values:  
-
-```python
-MODE_SYSTEM_PROMPT_MAP = {
-    "greedy": {"motion_coa", "grounding_coa"},
-    "text_action": {"text_action"},
-    "grounding": {"grounding_action"},
-    "motion": {"motion_action"},
-}
-```
+After training, serve the model with vLLM and run rollouts / evaluation with
+`examples/rollout_openha.py`. See [`README_OpenHA.md`](./README_OpenHA.md) for the original
+OpenHA inference instructions and the available `--output_mode` / `system_message_tag`
+schemes (`text_action`, `grounding_action`, `motion_action`, `grounding_coa`, `motion_coa`).
 
 ---
 
-## 📦 Models on 🤗 Hugging Face
+## Acknowledgements
 
-| Model Name                           | Size | HuggingFace URL                                                                                     | Training Framework                                   |
-|--------------------------------------|------|-----------------------------------------------------------------------------------------------------|------------------------------------------------------|
-| Minecraft-MotionHA-Qwen2VL-2509      | 7B   | https://huggingface.co/CraftJarvis/minecraft-motionha-qwen2vl-7b-2509                               | [TRL](https://github.com/huggingface/trl)            |
-| Minecraft-PointHA-Qwen2VL-2509       | 7B   | https://huggingface.co/CraftJarvis/minecraft-pointha-qwen2vl-7b-2509                                | [TRL](https://github.com/huggingface/trl)            |
-| Minecraft-TextVLA-Qwen2VL-2509       | 7B   | https://huggingface.co/CraftJarvis/minecraft-textvla-qwen2vl-7b-2509                                | [VeOmni](https://github.com/ByteDance-Seed/VeOmni)   |
-| Minecraft-OpenHA-Qwen2VL-2509-Base   | 7B   | https://huggingface.co/CraftJarvis/minecraft-openha-qwen2vl-7b-2509                                 | [VeOmni](https://github.com/ByteDance-Seed/VeOmni)   |
+This codebase builds on [OpenHA](https://github.com/CraftJarvis/OpenHA) and its
+[MineStudio](https://github.com/CraftJarvis/MineStudio) environment, plus
+[ROCKET-1](https://github.com/CraftJarvis/ROCKET-1) and
+[SAM2](https://github.com/facebookresearch/sam2). We thank the CraftJarvis team for
+open-sourcing the base framework that this work extends.
 
----
+## Citation
 
-## 📊 Datasets on 🤗 Hugging Face
-
-| Action Space     | Size        | HuggingFace URL                                                                 |
-|------------------|-------------|---------------------------------------------------------------------------------|
-| Motion Action    | 1B Tokens   | https://huggingface.co/datasets/CraftJarvis/minecraft-motion-action-dataset                 |
-| Grounding Action | 0.5B Tokens   | https://huggingface.co/datasets/CraftJarvis/minecraft-grounding-action-dataset              |
-| Text Action      | 2B Tokens   | https://huggingface.co/datasets/CraftJarvis/minecraft-text-action-dataset                   |
-| Motion CoA       | 0.5B Tokens | https://huggingface.co/datasets/CraftJarvis/minecraft-motion-coa-dataset                    |
-| Grounding CoA    | 0.2B Tokens | https://huggingface.co/datasets/CraftJarvis/minecraft-grounding-coa-dataset                 |
-
----
-
-
-## 😊 Acknowledgement
-We thank the following projects for their excellent work:  
-- [minerl](https://github.com/minerllabs/minerl)  
-- [malmo](https://github.com/microsoft/malmo)  
-- [MineStudio](https://github.com/CraftJarvis/MineStudio/tree/master)  
-- [ROCKET-1](https://github.com/CraftJarvis/ROCKET-1)  
-- [SAM2](https://github.com/facebookresearch/sam2)  
-
-
----
-
-## 📝 Citation
-If you find **OpenHA** useful, please give us a ⭐ on GitHub or cite us:
+If you use Minecraft-CoT in your work, please cite:
 
 ```bibtex
-@article{wang2025openha,
-      title={OpenHA: A Series of Open-Source Hierarchical Agentic Models in Minecraft}, 
-      author={Zihao Wang and Muyao Li and Kaichen He and Xiangyu Wang and Zhancun Mu and Anji Liu and Yitao Liang},
-      journal = {arXiv preprint arXiv:2509.13347},
-      year={2025},
-      url={https://arxiv.org/abs/2509.13347}, 
+@misc{minecraft-cot,
+  title        = {Minecraft-CoT: Multi-Stage SFT for Minecraft Vision-Language Agents},
+  author       = {Jin, Hongbo},
+  howpublished = {\url{https://github.com/Hongbo-Jin/Minecraft-CoT}},
+  year         = {2025}
 }
 ```

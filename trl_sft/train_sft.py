@@ -118,42 +118,39 @@ def download_from_s3(s3_path: str, local_dir: str, exclude_checkpoints: bool = F
     return str(local_dir)
 
 
-def debug_dry_run(args):
-    """
-    Quick END-TO-END smoke test against a real GPU, using the exact same code path as
-    real training: download model, build the REAL dataset via `build_minecraft_dataset`
-    (catches `train_dataset` type/format issues a collator-only test would miss),
-    construct a real `SFTTrainer` bounded by `--debug_steps` (no checkpoint/logging),
-    then `.train()`.
+def _resolve_max_len_kwarg(max_seq_length: int) -> Dict[str, int]:
+    """Detect whether SFTConfig uses `max_length` or `max_seq_length` (renamed in newer TRL)."""
+    sft_config_field_names = {f.name for f in dataclass_fields(SFTConfig)}
+    if "max_length" in sft_config_field_names:
+        return {"max_length": max_seq_length}
+    if "max_seq_length" in sft_config_field_names:
+        return {"max_seq_length": max_seq_length}
+    logger.warning("Neither `max_length` nor `max_seq_length` found on SFTConfig; skipping.")
+    return {}
 
-    Runs as a single process, so it does NOT validate multi-process sharding -- that
-    must be checked under torchrun (SFTTrainer/Accelerate shards the dataset exactly
-    once while preparing the DataLoader).
-    """
-    logger.info("=== DEBUG DRY RUN ===")
-    logger.info(f"Model: {args.model_path}")
-    logger.info(f"Data: {args.data_path}")
 
-    # Download model into a cache dir specific to this model (avoids reusing a
-    # stale download from a previously-tested model in the same container).
-    cache_dir = args.download_model or f"/tmp/{_local_cache_name(args.model_path)}"
-    local_model = args.model_path
+def _load_model_and_processor(args):
+    """Download (if S3), load model + processor, optionally freeze vision tower."""
+    local_model_path = args.model_path
     if args.model_path.startswith("s3://"):
-        local_model = download_from_s3(args.model_path.rstrip("/"), cache_dir, exclude_checkpoints=True)
-
-    logger.info("Loading model & processor...")
-    processor = AutoProcessor.from_pretrained(local_model, trust_remote_code=True)
+        cache_dir = args.download_model or f"/tmp/{_local_cache_name(args.model_path)}"
+        local_model_path = download_from_s3(args.model_path.rstrip("/"), cache_dir, exclude_checkpoints=True)
+    logger.info(f"Loading model from {local_model_path} ...")
+    processor = AutoProcessor.from_pretrained(local_model_path, trust_remote_code=True)
     model = AutoModelForImageTextToText.from_pretrained(
-        local_model,
+        local_model_path,
         dtype=torch.bfloat16,
         trust_remote_code=True,
         attn_implementation=args.attn_implementation,
     )
     if args.freeze_vision_tower:
         freeze_vision_tower(model)
+    return model, processor
 
-    logger.info("Building dataset (real `build_minecraft_dataset` code path)...")
-    dataset = build_minecraft_dataset(
+
+def _build_dataset(args, processor):
+    """Build the Minecraft SFT dataset (streaming, unsharded)."""
+    return build_minecraft_dataset(
         data_path=args.data_path,
         max_turns=args.max_turns,
         streaming=True,
@@ -166,51 +163,13 @@ def debug_dry_run(args):
         full_trajectory=args.full_trajectory,
     )
 
-    sft_config_field_names = {f.name for f in dataclass_fields(SFTConfig)}
-    max_len_kwarg = {}
-    if "max_length" in sft_config_field_names:
-        max_len_kwarg["max_length"] = args.max_seq_length
-    elif "max_seq_length" in sft_config_field_names:
-        max_len_kwarg["max_seq_length"] = args.max_seq_length
 
-    debug_output_dir = os.path.join(args.output_dir, "_debug_dry_run")
-    training_args = SFTConfig(
-        output_dir=debug_output_dir,
-        per_device_train_batch_size=args.per_device_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        max_steps=args.debug_steps,
-        learning_rate=args.learning_rate,
-        bf16=True,
-        gradient_checkpointing=args.gradient_checkpointing,
-        logging_steps=1,
-        save_strategy="no",
-        dataloader_num_workers=args.dataloader_num_workers,
-        deepspeed=args.deepspeed,
-        remove_unused_columns=False,
-        packing=False,
-        # prompt/completion path masks the context out of the loss (only the target
-        # "Action: ..." completion is trained on). --full_trajectory instead builds the
-        # labels inside `MultiStepVLMCollator`, so TRL's own masking must be OFF.
-        completion_only_loss=not args.full_trajectory,
-        seed=args.seed,
-        report_to=["none"],
-        **max_len_kwarg,
-    )
-
-    logger.info("Constructing SFTTrainer (this is where a bad train_dataset type/format would raise)...")
-    trainer = SFTTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=dataset,
-        processing_class=processor,
-    )
+def _setup_collator(trainer, args, processor):
+    """Set the appropriate data collator on the trainer."""
     if args.full_trajectory:
         trainer.data_collator = MultiStepVLMCollator(processor=processor, max_length=args.max_seq_length)
-    else:
+    elif not args.text_only:
         trainer.data_collator = ImmutableVisionCollatorAdapter(trainer.data_collator)
-    logger.info(f"Running trainer.train() for max_steps={args.debug_steps} with immutable VLM collator inputs...")
-    trainer.train()
-    logger.info(f"=== DRY RUN PASSED (SFTTrainer built + trained for {args.debug_steps} steps successfully) ===")
 
 
 # ─── main training ────────────────────────────────────────────────────────────
@@ -396,18 +355,6 @@ def main():
         "only reports a timeout, never which line each rank is stuck on). Keep below "
         "the NCCL timeout (600s). Set 0 to disable.",
     )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="GPU smoke/stress run: build the real dataset, construct a real SFTTrainer, train for "
-        "--debug_steps, then exit without saving a checkpoint or final model.",
-    )
-    parser.add_argument(
-        "--debug_steps",
-        type=int,
-        default=2,
-        help="Number of optimizer steps for --debug (default: 2).",
-    )
     parser.add_argument("--download_model", type=str, default=None, help="Local dir to cache downloaded model")
     parser.add_argument(
         "--attn_implementation",
@@ -447,56 +394,11 @@ def main():
     # ── seed ──
     set_seed(args.seed)
 
-    # ── debug mode ──
-    if args.debug:
-        debug_dry_run(args)
-        sys.exit(0)
-
     resume_from_checkpoint = _resolve_resume_checkpoint(args.resume_from_checkpoint, args.output_dir)
 
-    # ── download model ──
-    local_model_path = args.model_path
-    if args.model_path.startswith("s3://"):
-        cache_dir = args.download_model or f"/tmp/{_local_cache_name(args.model_path)}"
-        local_model_path = download_from_s3(args.model_path.rstrip("/"), cache_dir, exclude_checkpoints=True)
-
-    # ── load model & processor ──
-    logger.info(f"Loading model from {local_model_path} ...")
-    processor = AutoProcessor.from_pretrained(local_model_path, trust_remote_code=True)
-
-    model = AutoModelForImageTextToText.from_pretrained(
-        local_model_path,
-        dtype=torch.bfloat16,
-        trust_remote_code=True,
-        attn_implementation=args.attn_implementation,
-    )
-    if args.freeze_vision_tower:
-        freeze_vision_tower(model)
-
-    # ── load dataset ──
-    # For large S3 datasets, use streaming to avoid downloading everything.
-    # `build_minecraft_dataset` returns the complete, UNSHARDED genuine
-    # `datasets.IterableDataset` (built via `.map()`/`.filter()` chained on
-    # `datasets.load_dataset(...)`). SFTTrainer/Accelerate must be the only owner of
-    # process-level sharding when it prepares the DataLoader; pre-sharding here would
-    # silently divide the stream by world_size twice. A hand-rolled
-    # `torch.utils.data.IterableDataset` subclass is also rejected by SFTTrainer with
-    # `TypeError` at trainer-construction time.
-    dataset = build_minecraft_dataset(
-        data_path=args.data_path,
-        max_turns=args.max_turns,
-        streaming=True,
-        seed=args.seed,
-        data_format=args.data_format,
-        image_root=args.image_root,
-        text_only=args.text_only,
-        # Pre-filter oversized multi-image samples using the REAL processor/max_length
-        # about to be used for training -- see `_row_to_trl_sample`/`_exceeds_max_length`.
-        # `text_only` samples have no images so this is a no-op for Stage I regardless.
-        processor=processor,
-        max_seq_length=args.max_seq_length,
-        full_trajectory=args.full_trajectory,
-    )
+    # ── model + dataset ──
+    model, processor = _load_model_and_processor(args)
+    dataset = _build_dataset(args, processor)
 
     # ── training config ──
     total_batch_size = args.per_device_batch_size * args.gradient_accumulation_steps
@@ -520,17 +422,7 @@ def main():
         approx_dataset_size = 217800
         max_steps = (approx_dataset_size * args.num_train_epochs) // (total_batch_size * n_gpus)
 
-    # `SFTConfig`'s max-sequence-length kwarg was renamed from `max_seq_length` to
-    # `max_length` in newer TRL releases. Detect which one the installed TRL expects
-    # so this script keeps working across TRL versions.
-    sft_config_field_names = {f.name for f in dataclass_fields(SFTConfig)}
-    max_len_kwarg = {}
-    if "max_length" in sft_config_field_names:
-        max_len_kwarg["max_length"] = args.max_seq_length
-    elif "max_seq_length" in sft_config_field_names:
-        max_len_kwarg["max_seq_length"] = args.max_seq_length
-    else:
-        logger.warning("Neither `max_length` nor `max_seq_length` found on SFTConfig; skipping.")
+    max_len_kwarg = _resolve_max_len_kwarg(args.max_seq_length)
 
     # `TrainingArguments.warmup_ratio` was REMOVED as an `__init__` kwarg in some
     # transformers releases (consistent with a "warmup_ratio is deprecated ... removed
@@ -545,7 +437,7 @@ def main():
     # effect to 0 when omitted, which is the same as passing 0.0 explicitly anyway).
     warmup_kwargs: Dict[str, float] = {"warmup_steps": args.warmup_steps}
     if args.warmup_steps <= 0:
-        if "warmup_ratio" in sft_config_field_names:
+        if "warmup_ratio" in {f.name for f in dataclass_fields(SFTConfig)}:
             warmup_kwargs["warmup_ratio"] = args.warmup_ratio
         else:
             logger.warning(
@@ -602,10 +494,7 @@ def main():
         train_dataset=dataset,
         processing_class=processor,
     )
-    if args.full_trajectory:
-        trainer.data_collator = MultiStepVLMCollator(processor=processor, max_length=args.max_seq_length)
-    elif not args.text_only:
-        trainer.data_collator = ImmutableVisionCollatorAdapter(trainer.data_collator)
+    _setup_collator(trainer, args, processor)
     if args.stall_dump_seconds > 0:
         trainer.add_callback(HeartbeatCallback())
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
