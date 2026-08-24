@@ -63,13 +63,15 @@ import argparse
 import json
 import logging
 import os
+import shutil
+import subprocess
 import sys
 from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from typing import Dict, Optional
 
 import torch
-from transformers import AutoModelForImageTextToText, AutoProcessor, set_seed
+from transformers import AutoModelForImageTextToText, AutoProcessor, TrainerCallback, set_seed
 from trl import SFTConfig, SFTTrainer
 
 from collators import (
@@ -193,6 +195,10 @@ def _is_complete_trainer_checkpoint(checkpoint: str) -> bool:
         "pytorch_model.bin.index.json",
         "adapter_model.safetensors",
         "adapter_model.bin",
+        # DeepSpeed ZeRO checkpoint marker: written by engine.save_checkpoint only
+        # after all shards are flushed, so its presence means the checkpoint is
+        # complete for DeepSpeed runs (which have no model.safetensors/pytorch_model.bin).
+        "latest",
     )
     return any(os.path.isfile(os.path.join(checkpoint, artifact)) for artifact in model_artifacts)
 
@@ -226,6 +232,60 @@ def _resolve_resume_checkpoint(requested: Optional[str], output_dir: str) -> Opt
         raise ValueError(f"Resume checkpoint is incomplete: {requested}")
     logger.info(f"Resuming exact Trainer state from checkpoint: {requested}")
     return requested
+
+
+class S3CheckpointUploadCallback(TrainerCallback):
+    """Upload each saved checkpoint to S3 right after it's written (crash-safe resume).
+
+    `on_save` fires after the Trainer writes each `checkpoint-*`; we kick off an
+    async `aws s3 sync` so the upload never blocks training. A 48h deadline kill then
+    loses at most the in-flight checkpoint, and `--resume_from_checkpoint auto` can
+    pick up the latest complete one from S3 on the next run.
+    """
+
+    def __init__(self, s3_output_dir: str):
+        self.s3_output_dir = s3_output_dir.rstrip("/")
+        self._last_proc: Optional[subprocess.Popen] = None
+        # Prefer s5cmd (much faster concurrent upload) when available; fall back to aws cli.
+        self._use_s5cmd = shutil.which("s5cmd") is not None
+
+    def _sync_command(self, output_dir: str):
+        if self._use_s5cmd:
+            # s5cmd sync needs the source dir to end with "/" to sync its contents.
+            return [
+                "s5cmd", "sync", "--concurrency", "16",
+                output_dir.rstrip("/") + "/", self.s3_output_dir + "/",
+            ]
+        return ["aws", "s3", "sync", output_dir, self.s3_output_dir, "--only-show-errors"]
+
+    def on_save(self, args, state, control, **kwargs):
+        output_dir = args.output_dir
+        if not os.path.isdir(output_dir):
+            return
+        # Avoid overlapping syncs: wait for the previous one if it's still running.
+        if self._last_proc is not None and self._last_proc.poll() is None:
+            logger.info("Waiting for previous S3 upload to finish before starting the next...")
+            self._last_proc.wait()
+        self._last_proc = subprocess.Popen(
+            self._sync_command(output_dir),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        logger.info(f"Started async S3 upload: {output_dir} -> {self.s3_output_dir}")
+
+    def finalize(self, output_dir: str):
+        """Wait for the last upload, then do a final full sync (final model + processor)."""
+        if self._last_proc is not None:
+            self._last_proc.wait()
+        ret = subprocess.call(
+            self._sync_command(output_dir),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if ret != 0:
+            logger.warning(f"Final S3 upload failed (exit={ret}) for {output_dir} -> {self.s3_output_dir}")
+        else:
+            logger.info(f"Final S3 upload complete: {output_dir} -> {self.s3_output_dir}")
 
 
 def main():
@@ -356,6 +416,16 @@ def main():
         "the NCCL timeout (600s). Set 0 to disable.",
     )
     parser.add_argument("--download_model", type=str, default=None, help="Local dir to cache downloaded model")
+    parser.add_argument(
+        "--s3_output_dir",
+        type=str,
+        default=None,
+        help="If set, upload each saved checkpoint to this S3 prefix right after it's "
+        "written (async, non-blocking), and do a final full sync after training. "
+        "Enables crash-safe resume: a 48h deadline kill loses at most the in-flight "
+        "checkpoint, and --resume_from_checkpoint auto can pick up the latest complete "
+        "one from S3 on the next run.",
+    )
     parser.add_argument(
         "--attn_implementation",
         type=str,
@@ -497,9 +567,15 @@ def main():
     _setup_collator(trainer, args, processor)
     if args.stall_dump_seconds > 0:
         trainer.add_callback(HeartbeatCallback())
+    s3_upload_callback = None
+    if args.s3_output_dir:
+        s3_upload_callback = S3CheckpointUploadCallback(args.s3_output_dir)
+        trainer.add_callback(s3_upload_callback)
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     trainer.save_model()
     processor.save_pretrained(args.output_dir)
+    if s3_upload_callback is not None:
+        s3_upload_callback.finalize(args.output_dir)
 
     logger.info(f"Training finished. Model saved to {args.output_dir}")
 

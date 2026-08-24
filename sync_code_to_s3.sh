@@ -2,9 +2,9 @@
 # Mirror this repo to the S3 code path that koala jobs pull from
 # (s3://arcwm-code-us-west-2/axiom/code/Minecraft-CoT/).
 #
-# SECURITY: local secret files (.env.wandb, .env, .envrc, *.env.local) are
-# explicitly excluded so W&B keys / credentials never reach S3. The committed
-# template .env.wandb.example is NOT excluded (it contains no secrets).
+# NOTE: the W&B key is hardcoded in trl_sft/common.sh / trl_sft/launch.sh and
+# syncs to S3 with the scripts (intentional). Local secret files (.env.wandb,
+# .env, .envrc, *.env.local) are still excluded to avoid accidental leakage.
 #
 # Usage:
 #   bash sync_code_to_s3.sh            # safe full-repo differential sync
@@ -39,5 +39,5 @@ else
   echo "[sync] -> $DEST"
   s5cmd sync "${EXCLUDES[@]}" ./ "$DEST"
 fi
-echo "[sync] done. Verify no secrets leaked:"
+echo "[sync] done. Verify no .env files leaked:"
 s5cmd ls "${DEST}trl_sft/" 2>/dev/null | grep -iE "\.env" || echo "  (no .env files in trl_sft/ — good)"

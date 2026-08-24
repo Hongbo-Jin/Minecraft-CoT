@@ -146,11 +146,20 @@ class MultiStepVLMCollator(DataCollatorForVisionLanguageModeling):
             in_assistant = False
             for t, tok_id in enumerate(row):
                 if tok_id == im_start and t + 1 < len(row) and row[t + 1] == assistant_id:
+                    # Mask the two format tokens that open an assistant turn
+                    # (<|im_start|> and the "assistant" role token); only the
+                    # content tokens that follow contribute to the loss.
+                    labels[b, t] = -100
+                    labels[b, t + 1] = -100
                     in_assistant = True
+                    continue
+                if tok_id == im_end:
+                    # Mask the closing <|im_end|> format token as well.
+                    labels[b, t] = -100
+                    in_assistant = False
+                    continue
                 if not in_assistant:
                     labels[b, t] = -100
-                if tok_id == im_end:
-                    in_assistant = False
         labels[output["attention_mask"] == 0] = -100
         output["labels"] = labels
         return output

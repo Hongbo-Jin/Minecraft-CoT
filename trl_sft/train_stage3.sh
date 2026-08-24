@@ -22,16 +22,35 @@ source "$SCRIPT_DIR/common.sh"
 
 export WANDB_RUN_NAME="${WANDB_RUN_NAME:-minecraft-sft-stage3-qwen35-9b}"
 
+# Upload every saved checkpoint to S3 right after it's written (crash-safe resume:
+# a 48h deadline kill loses at most the in-flight checkpoint). Override with
+# S3_OUTPUT_DIR=... or disable with S3_OUTPUT_DIR="" (empty string).
+S3_OUTPUT_DIR="${S3_OUTPUT_DIR:-s3://arcwm-code-us-west-2/axiom/model/$WANDB_RUN_NAME}"
+
 echo "=== Stage III training (full-trajectory multi-step loss): NPROC=$NPROC ==="
 bootstrap_env
 localize_stage3_parquet_dataset
-echo "MODEL_PATH=$MODEL_PATH OUTPUT_DIR=$OUTPUT_DIR MAX_STEPS=$MAX_STEPS"
+echo "MODEL_PATH=$MODEL_PATH OUTPUT_DIR=$OUTPUT_DIR MAX_STEPS=$MAX_STEPS S3_OUTPUT_DIR=$S3_OUTPUT_DIR"
+
+# Crash-safe resume: if the local output dir has no checkpoint yet but S3 does
+# (e.g. a previous run was killed by the 48h deadline), pull the latest checkpoints
+# down first so `--resume_from_checkpoint auto` can pick them up.
+if [ -n "$S3_OUTPUT_DIR" ] && ! compgen -G "$OUTPUT_DIR/checkpoint-*" > /dev/null 2>&1; then
+    echo "No local checkpoint; pulling from S3 for resume: $S3_OUTPUT_DIR"
+    if command -v s5cmd >/dev/null 2>&1; then
+        s5cmd sync --concurrency 16 "${S3_OUTPUT_DIR%/}/*" "$OUTPUT_DIR/" || true
+    else
+        aws s3 sync "$S3_OUTPUT_DIR" "$OUTPUT_DIR" --only-show-errors || true
+    fi
+fi
+
 torchrun --nproc_per_node="$NPROC" --tee 3 train_sft.py \
     --model_path "$MODEL_PATH" \
     --data_path "$DATA_PATH" \
     --data_format parquet \
     --download_model "$DOWNLOAD_CACHE" \
     --output_dir "$OUTPUT_DIR" \
+    --s3_output_dir "$S3_OUTPUT_DIR" \
     --resume_from_checkpoint auto \
     --full_trajectory \
     --attn_implementation "$ATTN_IMPL" \
@@ -44,7 +63,7 @@ torchrun --nproc_per_node="$NPROC" --tee 3 train_sft.py \
     --max_steps "$MAX_STEPS" \
     --learning_rate 8e-6 \
     --weight_decay 0.05 \
-    --warmup_ratio 0.03 \
+    --warmup_steps 102 \
     --lr_scheduler_type cosine \
     --deepspeed ds_zero2_no_offload.json \
     --save_steps 200 \

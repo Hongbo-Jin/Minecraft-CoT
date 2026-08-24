@@ -35,14 +35,11 @@ LOCAL_PARQUET_ROOT="${LOCAL_PARQUET_ROOT:-/local-ssd/minecraft-text-action}"
 DOWNLOAD_CACHE="${DOWNLOAD_CACHE:-/local-ssd/model_cache}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-2}"
 
-# W&B: sourced from a git-ignored local file (this repo is PUBLIC on GitHub -- never
-# commit a real key). Create trl_sft/.env.wandb with WANDB_API_KEY/WANDB_PROJECT/
-# WANDB_RUN_NAME. Only applies to LOCAL runs of this script; remote koala jobs must
-# export WANDB_API_KEY explicitly in the submit command instead.
-if [ -f "$SCRIPT_DIR/.env.wandb" ]; then
-    # shellcheck disable=SC1091
-    source "$SCRIPT_DIR/.env.wandb"
-fi
+# W&B: key hardcoded here so both local and remote koala jobs pick it up
+# automatically -- no need to export WANDB_API_KEY in the submit -c command.
+# Overridable via env: export WANDB_API_KEY=... before running.
+export WANDB_API_KEY="${WANDB_API_KEY:-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}"
+export WANDB_PROJECT="${WANDB_PROJECT:-minecraft-sft}"
 
 # Make the training env ready to run `torchrun` (idempotent -- skips whatever's already
 # installed). The default koala training image ships NO torch/trl/deepspeed at all, and
@@ -51,11 +48,14 @@ fi
 # failed jobs. requirements.txt has flash-attn commented out (see its own comment) --
 # --attn-impl sdpa (the default) does NOT need it installed at all.
 bootstrap_env() {
-    # The koala image runs under the C locale; TRL's create_model_card() (on every
+    # The koala image runs under the C locale and may not even ship C.UTF-8 locale
+    # data, so `LANG=C.UTF-8` alone is NOT enough: TRL's create_model_card() (on every
     # --save_steps checkpoint) reads its model-card template with Path.read_text()'s
-    # default encoding and crashes with UnicodeDecodeError under ascii. Export a UTF-8
-    # locale so Python starts in UTF-8 mode (train_sft.py also sets it defensively).
-    export LANG=C.UTF-8 LC_ALL=C.UTF-8
+    # default encoding and crashes with `UnicodeDecodeError: 'ascii' codec can't decode
+    # byte 0xc3` under ascii. PYTHONUTF8=1 forces Python's UTF-8 mode regardless of
+    # available locales -- this is the fix that MUST travel with every submission, so we
+    # set it here (self-contained) rather than relying on the submit -c command.
+    export LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONUTF8=1
     if ! command -v conda >/dev/null 2>&1; then
         echo "[env] no conda found, assuming torch/trl/deepspeed are already on PATH." >&2
         return
@@ -64,10 +64,38 @@ bootstrap_env() {
     source /opt/conda/etc/profile.d/conda.sh
     conda env list | grep -q "^sft " || conda create -n sft python=3.10 -y -q
     conda activate sft
+    # Network to PyPI / the CUDA wheel index is occasionally flaky on koala -- a
+    # dropped connection mid-download (IncompleteRead) fails the whole job. Retry at
+    # the SHELL level (NOT via pip's own --retries/--retry-delay flags, which vary by
+    # pip version and crash on unknown options) so a single blip doesn't kill an
+    # otherwise-good launch.
+    pip_retry() {
+        local n=1 max=5
+        while [ "$n" -le "$max" ]; do
+            if pip install "$@"; then
+                return 0
+            fi
+            echo "[env] pip install attempt $n/$max failed, retrying in 5s..." >&2
+            n=$((n + 1))
+            sleep 5
+        done
+        echo "[env] pip install failed after $max attempts" >&2
+        return 1
+    }
     python -c "import torch" 2>/dev/null || \
-        pip install -q torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+        pip_retry -q torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
     python -c "import trl, transformers, deepspeed, datasets, accelerate" 2>/dev/null || \
-        pip install -q -r requirements.txt
+        pip_retry -q -r requirements.txt
+    # flash-attention is opt-in and deliberately NOT in requirements.txt: its prebuilt
+    # wheel is ABI-incompatible with the koala torch build (import-time "undefined
+    # symbol"), so it must be built from source with --no-build-isolation (see the note
+    # in requirements.txt). Only install it when the user actually passed
+    # --attn-impl flash_attention_2; the sdpa default needs nothing extra. Runs inside
+    # the activated `sft` env so the import is visible to train_sft.py.
+    if [ "$ATTN_IMPL" = "flash_attention_2" ]; then
+        python -c "import flash_attn" 2>/dev/null || \
+            pip_retry -q flash-attn==2.7.4.post1 --no-build-isolation
+    fi
 }
 
 # Pre-download every Stage II JSONL shard in `$DATA_PATH` plus every image

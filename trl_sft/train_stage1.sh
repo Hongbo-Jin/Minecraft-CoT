@@ -3,9 +3,9 @@
 # Usage:
 #   bash train_stage1.sh [--nproc N] [--nnodes N] [--node-rank R] [--master-addr A] [--master-port P] [--attn-impl sdpa|flash_attention_2]
 #
-# W&B: if WANDB_API_KEY is set (via trl_sft/.env.wandb for local runs, or exported in the
-# koala submit command for remote runs), metrics are logged automatically. Override the
-# dashboard run name with WANDB_RUN_NAME; a per-stage default is applied below.
+# W&B: WANDB_API_KEY is hardcoded in common.sh (sourced below), so metrics are logged
+# automatically for both local and remote koala runs. Override the dashboard run name
+# with WANDB_RUN_NAME; a per-stage default is applied below.
 set -euo pipefail
 
 MODEL_PATH="${MODEL_PATH:-s3://arcwm-code-us-west-2/axiom/model/Qwen3.5-9B-stage1-8gpu-20260817}"

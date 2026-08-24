@@ -102,11 +102,10 @@ bash train_stage2.sh --nproc 8 --attn-impl flash_attention_2
 `DATALOADER_NUM_WORKERS`. `train_stage2.sh` derives `MAX_STEPS` from the dataset size and
 the effective batch size automatically.
 
-**W&B**: metrics are logged automatically whenever `WANDB_API_KEY` is set. For local runs,
-copy `trl_sft/.env.wandb.example` to `trl_sft/.env.wandb` and fill in the key (the launcher
-sources it). For remote koala jobs, export `WANDB_API_KEY` in the submit command instead.
-Override the dashboard run name with `WANDB_RUN_NAME` (each stage script also sets a
-sensible default).
+**W&B**: metrics are logged automatically — `WANDB_API_KEY` is hardcoded in
+`trl_sft/common.sh` (sourced by all stage scripts), so both local and remote koala jobs
+pick it up without extra setup. Override the dashboard run name with `WANDB_RUN_NAME`
+(each stage script also sets a sensible default).
 
 The single-file `trl_sft/launch.sh` contains the same three stages behind a `MODE`
 argument for reference.

@@ -62,14 +62,11 @@ STAGE2_TRAIN_SAMPLES="${STAGE2_TRAIN_SAMPLES:-261461}"
 TOTAL_GPUS=$((NNODES * NPROC))
 MAX_STEPS="${MAX_STEPS:-$((STAGE2_TRAIN_SAMPLES / (PER_DEVICE_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * TOTAL_GPUS)))}"
 
-# W&B: sourced from a git-ignored local file (this repo is PUBLIC on GitHub -- never
-# commit a real key). Create trl_sft/.env.wandb with WANDB_API_KEY/WANDB_PROJECT/
-# WANDB_RUN_NAME. Only applies to LOCAL runs of this script; remote koala jobs must
-# export WANDB_API_KEY explicitly in the submit command instead.
-if [ -f "$SCRIPT_DIR/.env.wandb" ]; then
-    # shellcheck disable=SC1091
-    source "$SCRIPT_DIR/.env.wandb"
-fi
+# W&B: key hardcoded here so both local and remote koala jobs pick it up
+# automatically -- no need to export WANDB_API_KEY in the submit -c command.
+# Overridable via env: export WANDB_API_KEY=... before running.
+export WANDB_API_KEY="${WANDB_API_KEY:-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}"
+export WANDB_PROJECT="${WANDB_PROJECT:-minecraft-sft}"
 
 # Make the training env ready to run `torchrun` (idempotent -- skips whatever's already
 # installed). The default koala training image ships NO torch/trl/deepspeed at all, and
@@ -255,7 +252,7 @@ case "$MODE" in
             --max_steps "$MAX_STEPS" \
             --learning_rate 8e-6 \
             --weight_decay 0.05 \
-            --warmup_ratio 0.03 \
+            --warmup_steps 102 \
             --lr_scheduler_type cosine \
             --deepspeed ds_zero2_no_offload.json \
             --save_steps 200 \
