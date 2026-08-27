@@ -68,8 +68,8 @@ trainer for vision-language models. It supports two data layouts:
 | Stage | Data | Key flags | DeepSpeed | Notes |
 |-------|------|-----------|-----------|-------|
 | **Stage I** | text-only QA (`mc-qa-*.jsonl`) | `--text_only --freeze_vision_tower` | `ds_zero1.json` | World-knowledge post-training; ViT + adapter frozen |
-| **Stage II** | jsonl VLM (`mc-vqa`, `mc-caption`, `mc-grounding-*`) | `--data_format jsonl --max_turns 4` | `ds_zero2.json` | Vision-language SFT on image + text |
-| **Stage III** | parquet full trajectories (`minecraft-text-action-dataset`) | `--data_format parquet --full_trajectory` | `ds_zero2_no_offload.json` | Multi-step loss over whole trajectories |
+| **Stage II** | jsonl VLM (`mc-vqa`, `mc-caption`, `mc-grounding-*`) | `--data_format jsonl` | `ds_zero2.json` | Vision-language SFT on image + text |
+| **Stage III** | parquet full trajectories (`minecraft-text-action-dataset`) | `--data_format parquet --full_trajectory` (`--full_trajectory` is mandatory for parquet) | `ds_zero2_no_offload.json` | Multi-step loss over whole trajectories |
 
 ### Supported backbones & data
 

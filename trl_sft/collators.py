@@ -154,8 +154,20 @@ class MultiStepVLMCollator(DataCollatorForVisionLanguageModeling):
                     in_assistant = True
                     continue
                 if tok_id == im_end:
-                    # Mask the closing <|im_end|> format token as well.
-                    labels[b, t] = -100
+                    # Do NOT mask the closing <|im_end|>: it doubles as the EOS signal
+                    # for an assistant turn, and it is the ONLY supervision the model
+                    # gets for "this action is finished, stop generating". Masking it
+                    # (as an earlier version of this collator did) produced a
+                    # checkpoint that never emitted EOS at inference time -- every
+                    # rollout step ran to the max_tokens cap and degenerated into
+                    # repeated filler ("... 0 0 0 0" / "and click(left) and
+                    # click(right) ..."), which corrupted the parsed action and drove
+                    # the real-env success rate to 0%. Verified by contrast: a
+                    # checkpoint trained with <|im_end|> in the loss emits ~31-char
+                    # actions and stops cleanly; the masked one emitted 1630-5588
+                    # chars at every single step.
+                    if not in_assistant:
+                        labels[b, t] = -100
                     in_assistant = False
                     continue
                 if not in_assistant:

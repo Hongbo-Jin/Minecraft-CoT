@@ -209,7 +209,6 @@ case "$MODE" in
                 --output_dir "$OUTPUT_DIR" \
                 --resume_from_checkpoint auto \
                 --attn_implementation "$ATTN_IMPL" \
-                --max_turns 4 \
                 --max_seq_length "$MAX_SEQ_LENGTH" \
                 --per_device_batch_size "$PER_DEVICE_BATCH_SIZE" \
                 --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \

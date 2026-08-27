@@ -78,7 +78,7 @@ mkdir -p "${LOCAL_MODEL_DIR}" "${RECORD_ROOT}" "${LOG_DIR}" "${MINESTUDIO_DIR}"
 if [ "${EVAL_BENCHMARK}" != "smoke" ] && [ -z "${TASK_DIFFICULTY_LIST}" ]; then
     echo "[task-list] generating EVAL_BENCHMARK=${EVAL_BENCHMARK} task list via build_task_list.py"
     export TASK_LIST_MANIFEST="${RECORD_ROOT}/task_list_manifest.json"
-    TASK_DIFFICULTY_LIST="$(python3 "$(dirname "$0")/build_task_list.py" --scope "${EVAL_BENCHMARK}")"
+    TASK_DIFFICULTY_LIST="$(python3 "$(dirname "${BASH_SOURCE[0]}")/build_task_list.py" --scope "${EVAL_BENCHMARK}")"
     export TASK_DIFFICULTY_LIST
     echo "[task-list] $(echo "${TASK_DIFFICULTY_LIST}" | wc -w) tasks, manifest -> ${TASK_LIST_MANIFEST}"
 fi

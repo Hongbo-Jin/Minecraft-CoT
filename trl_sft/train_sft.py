@@ -10,16 +10,9 @@ Model: s3://arcwm-code-us-west-2/axiom/model/Qwen3.5-9B/ (also works for Qwen2-V
 See `launch.sh` for ready-to-run `debug`/`train` (Stage I/II)/`stage3` (Stage III,
 full-trajectory multi-step loss) invocations, including env bootstrap + S3 localization.
 
-Usage (Stage II, prompt/completion, only the final "Action: ..." turn trained on):
-    torchrun --nproc_per_node=$NPROC train_sft.py \
-        --model_path s3://.../Qwen3.5-9B --output_dir ./output \
-        --data_path s3://.../minecraft-text-action-dataset/data/train-*.parquet \
-        --max_turns 4 --max_seq_length 16384 \
-        --per_device_batch_size 2 --gradient_accumulation_steps 4 \
-        --num_train_epochs 1 --deepspeed ds_zero2.json
-
-    # jsonl / flat-QA layout (e.g. minecraft-vlp); --data_format auto-detects from the
-    # ".jsonl" extension, --image_root defaults to the dir containing --data_path:
+Usage (Stage II, jsonl flat-QA, prompt/completion, only the final "Action: ..." turn
+trained on -- --data_format auto-detects from the ".jsonl" extension, --image_root
+defaults to the dir containing --data_path):
     torchrun --nproc_per_node=$NPROC train_sft.py \
         --model_path s3://.../Qwen2-VL-7B-Instruct --output_dir ./output \
         --data_path s3://.../minecraft-vlp/mc-vqa-241102.jsonl
@@ -154,9 +147,7 @@ def _build_dataset(args, processor):
     """Build the Minecraft SFT dataset (streaming, unsharded)."""
     return build_minecraft_dataset(
         data_path=args.data_path,
-        max_turns=args.max_turns,
         streaming=True,
-        seed=args.seed,
         data_format=args.data_format,
         image_root=args.image_root,
         text_only=args.text_only,
@@ -343,7 +334,6 @@ def main():
         "'auto' (default) resumes the latest complete checkpoint-* in --output_dir; "
         "use 'none' to force a new run.",
     )
-    parser.add_argument("--max_turns", type=int, default=4, help="Max (user,assistant) pairs per sample")
     parser.add_argument(
         "--full_trajectory",
         action="store_true",

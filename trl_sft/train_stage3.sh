@@ -36,11 +36,23 @@ echo "MODEL_PATH=$MODEL_PATH OUTPUT_DIR=$OUTPUT_DIR MAX_STEPS=$MAX_STEPS S3_OUTP
 # (e.g. a previous run was killed by the 48h deadline), pull the latest checkpoints
 # down first so `--resume_from_checkpoint auto` can pick them up.
 if [ -n "$S3_OUTPUT_DIR" ] && ! compgen -G "$OUTPUT_DIR/checkpoint-*" > /dev/null 2>&1; then
-    echo "No local checkpoint; pulling from S3 for resume: $S3_OUTPUT_DIR"
-    if command -v s5cmd >/dev/null 2>&1; then
-        s5cmd sync --concurrency 16 "${S3_OUTPUT_DIR%/}/*" "$OUTPUT_DIR/" || true
+    echo "No local checkpoint; pulling latest from S3: $S3_OUTPUT_DIR"
+    LATEST_CKPT=$(aws s3 ls "$S3_OUTPUT_DIR/" 2>/dev/null | grep -oE 'checkpoint-[0-9]+' | sort -t- -k2 -n | tail -1)
+    if [ -n "$LATEST_CKPT" ]; then
+        echo "Latest: $LATEST_CKPT"
+        if command -v s5cmd >/dev/null 2>&1; then
+            s5cmd sync --concurrency 16 "${S3_OUTPUT_DIR%/}/${LATEST_CKPT}/*" "$OUTPUT_DIR/${LATEST_CKPT}/"
+        else
+            aws s3 sync "$S3_OUTPUT_DIR/$LATEST_CKPT" "$OUTPUT_DIR/$LATEST_CKPT" --only-show-errors
+        fi
+        if [ -f "$OUTPUT_DIR/$LATEST_CKPT/latest" ]; then
+            echo "Checkpoint downloaded OK: $LATEST_CKPT"
+        else
+            echo "ERROR: checkpoint download failed" >&2
+            exit 1
+        fi
     else
-        aws s3 sync "$S3_OUTPUT_DIR" "$OUTPUT_DIR" --only-show-errors || true
+        echo "No checkpoint found on S3, starting from scratch."
     fi
 fi
 

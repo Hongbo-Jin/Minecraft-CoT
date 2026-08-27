@@ -6,6 +6,7 @@ Directory layout expected (as produced by rollout_openha.py):
 """
 import argparse
 import json
+import math
 import os
 from collections import defaultdict
 
@@ -32,7 +33,7 @@ def main():
     parser.add_argument("--output_json", type=str, required=True)
     args = parser.parse_args()
 
-    per_task = defaultdict(lambda: {"success": 0, "total": 0, "frames_on_success": []})
+    per_task = defaultdict(lambda: {"success": 0, "total": 0, "frames_on_success": [], "rollout_results": []})
 
     if os.path.isdir(args.record_path):
         for model_id_dir in os.listdir(args.record_path):
@@ -52,6 +53,7 @@ def main():
                     if os.path.isfile(success_file):
                         per_task[task_name]["total"] += 1
                         per_task[task_name]["success"] += 1
+                        per_task[task_name]["rollout_results"].append(1)
                         try:
                             with open(success_file) as f:
                                 per_task[task_name]["frames_on_success"].append(json.load(f).get("frames"))
@@ -59,19 +61,23 @@ def main():
                             pass
                     elif os.path.isfile(loss_file):
                         per_task[task_name]["total"] += 1
+                        per_task[task_name]["rollout_results"].append(0)
 
     overall_success = sum(v["success"] for v in per_task.values())
     overall_total = sum(v["total"] for v in per_task.values())
 
     # 按 Embodied / GUI / Combat 三大类聚合，对应论文 Table 3 的分组统计
     # (avg_frames_on_success 对应论文的 "Steps" 列，success_rate 对应 "ASR" 列)。
-    per_category = defaultdict(lambda: {"success": 0, "total": 0, "frames_on_success": [], "tasks": set()})
+    per_category = defaultdict(lambda: {"success": 0, "total": 0, "frames_on_success": [], "tasks": set(), "pass_at_1": 0, "rollout_results": []})
     for task, v in per_task.items():
         cat = classify_task_category(task)
         per_category[cat]["success"] += v["success"]
         per_category[cat]["total"] += v["total"]
         per_category[cat]["frames_on_success"].extend(v["frames_on_success"])
         per_category[cat]["tasks"].add(task)
+        per_category[cat]["rollout_results"].extend(v["rollout_results"])
+        if v["success"] > 0:
+            per_category[cat]["pass_at_1"] += 1
 
     summary = {
         "model_name": args.model_name,
@@ -81,6 +87,11 @@ def main():
                 "success": v["success"],
                 "total": v["total"],
                 "success_rate": (v["success"] / v["total"]) if v["total"] else None,
+                "pass_at_1": 1 if v["success"] > 0 else 0,
+                "std": (
+                    math.sqrt(sum((r - v["success"] / v["total"]) ** 2 for r in v["rollout_results"]) / len(v["rollout_results"]))
+                    if v["total"] else None
+                ),
                 "avg_frames_on_success": (
                     sum(f for f in v["frames_on_success"] if f is not None) / len(v["frames_on_success"])
                     if v["frames_on_success"] else None

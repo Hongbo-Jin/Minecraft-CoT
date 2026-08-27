@@ -37,6 +37,8 @@ case "${LAUNCH_SCRIPT}" in
     launch_textvla_qwen2vl_7b.sh)              SHORT_TAG="tv-q2vl" ;;
     launch_textvla_qwen2vl_7b_checkpoint.sh)   SHORT_TAG="tv-q2vl" ;;
     launch_textvla_qwen35_9b_checkpoint.sh)    SHORT_TAG="tv-q35" ;;
+    launch_stage2_qwen2vl_7b.sh)               SHORT_TAG="s2-q2vl" ;;
+    launch_stage2_qwen35_9b.sh)                SHORT_TAG="s2-q35" ;;
     *)
         # 未知脚本：用脚本名(去掉launch_/.sh、下划线转连字符)截断到8字符 + 4位hash保证唯一
         SHORT_TAG="${LAUNCH_SCRIPT#launch_}"
@@ -57,12 +59,16 @@ BENCH_EXPORT=""
 if [ -n "${EVAL_BENCHMARK:-}" ]; then
     BENCH_EXPORT="export EVAL_BENCHMARK=${EVAL_BENCHMARK}; "
 fi
+TASKLIST_EXPORT=""
+if [ -n "${TASK_DIFFICULTY_LIST:-}" ]; then
+    TASKLIST_EXPORT="export TASK_DIFFICULTY_LIST=$(printf '%q' "${TASK_DIFFICULTY_LIST}"); "
+fi
 
 # "axiomjin-eval-"(14字符) + SHORT_TAG + CKPT_SUFFIX，务必控制在29字符以内。
 JOB_NAME="axiomjin-eval-${SHORT_TAG}${CKPT_SUFFIX}"
 JOB_NAME="${JOB_NAME:0:29}"
 
-REMOTE_CMD="set -euo pipefail; export REPO_ROOT=/data/work/run_codes/Minecraft-CoT; ${CKPT_EXPORT}${BENCH_EXPORT}cd /data/work/run_codes/Minecraft-CoT; apt-get update -qq 2>&1 | tail -3 || true; apt-get install -y -qq xvfb 2>&1 | tail -5 || true; bash examples/eval_backbones/${LAUNCH_SCRIPT}"
+REMOTE_CMD="set -euo pipefail; export REPO_ROOT=/data/work/run_codes/Minecraft-CoT; ${CKPT_EXPORT}${BENCH_EXPORT}${TASKLIST_EXPORT}cd /data/work/run_codes/Minecraft-CoT; apt-get update -qq 2>&1 | tail -3 || true; apt-get install -y -qq xvfb 2>&1 | tail -5 || true; bash examples/eval_backbones/${LAUNCH_SCRIPT}"
 
 echo "[submit] job=${JOB_NAME}"
 echo "[submit] launch_script=${LAUNCH_SCRIPT} ckpt=${CKPT:-<none>} eval_benchmark=${EVAL_BENCHMARK:-<run_backbone_eval.sh默认值>}"

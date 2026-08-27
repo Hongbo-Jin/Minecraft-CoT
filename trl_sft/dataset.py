@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import io
 import logging
-import random
 from typing import Dict, List, Optional, Tuple, Union
 
 from datasets import concatenate_datasets, load_dataset
@@ -27,83 +26,17 @@ logger = logging.getLogger(__name__)
 # ─── dataset helpers ──────────────────────────────────────────────────────────
 
 
-def build_messages(
-    conversations: list,
-    image_bytes_list: list,
-    max_turns: int,
-    rng: Optional[random.Random] = None,
-) -> Tuple[Optional[List[Dict]], Optional[List[Dict]], Optional[List[Image.Image]]]:
-    """
-    Convert a single parquet row into TRL's conversational *prompt-completion* format:
-    (prompt, completion, images).
-
-    Only the LAST assistant turn is the training target ("Action: ..."); everything
-    before it is context that must NOT contribute to the loss. Splitting into
-    prompt/completion (rather than a flat `messages` list) lets
-    `SFTConfig(completion_only_loss=True)` mask the context out -- the only
-    loss-masking TRL currently supports for VLM datasets (`assistant_only_loss` raises
-    for VLMs).
-
-    Args:
-        conversations: list of {role, content[{type, text/image}]}
-        image_bytes_list: list of JPEG bytes, one per user turn (with image)
-        max_turns: maximum number of (user, assistant) pairs to include
-        rng: `random.Random` for the history-length sample. Defaults to the global
-            `random` module; callers needing per-sample determinism (e.g.
-            `_row_to_trl_sample`) should pass their own instance.
-
-    Returns:
-        (prompt, completion, images): `prompt` is every turn except the final
-        assistant turn; `completion` is a single-element list with just that turn;
-        `images` is the flat, ordered list of decoded `PIL.Image`s matching `prompt`'s
-        `{"type": "image"}` placeholders (pass as the sample's top-level "images" key,
-        not embedded in `content`).
-    """
-    rng = rng if rng is not None else random
-    if not conversations or len(conversations) < 2:
-        return None, None, None
-
-    # Some rows may start with a stray non-user turn (seen in the original VeOmni
-    # preprocessing); drop it so the user/assistant pairing below stays aligned.
-    if conversations[0]["role"] != "user":
-        conversations = conversations[1:]
-    if not conversations or conversations[-1]["role"] != "assistant":
-        return None, None, None
-
-    # Count total turns
-    total_turns = len(conversations) // 2
-
-    # Random history length: 0 to min(total_turns-1, max_turns)
-    max_possible = min(total_turns - 1, max_turns)
-    if max_possible < 0:
-        return None, None, None
-    history_len = rng.randint(0, max_possible)
-
-    # Take the last (history_len + 1) turns
-    start_turn = total_turns - (history_len + 1)
-    start_idx = start_turn * 2
-
-    selected_convs = conversations[start_idx:]
-    # NOTE: this slices `image_bytes_list` by *pair index* (`start_turn`), which matches
-    # `minecraft-text-action-dataset`'s parquet schema: exactly one `image_bytes` entry
-    # per (user, assistant) trajectory step. See
-    # `build_messages_qa` for the FLAT/no-slicing indexing used by the jsonl format.
-    selected_image_bytes = image_bytes_list[start_turn:] if image_bytes_list else []
-
-    return _split_prompt_completion_with_images(selected_convs, selected_image_bytes)
-
-
 def _split_prompt_completion_with_images(
     conversations: List[Dict],
     image_bytes_list: List[bytes],
 ) -> Tuple[List[Dict], List[Dict], List[Image.Image]]:
     """
-    Shared tail used by `build_messages` (parquet trajectory rows) and
-    `build_messages_qa` (flat QA/jsonl rows): walks `conversations`, keeps
-    `{"type": "image"}` placeholders in-place while decoding the matching entry of the
-    flat `image_bytes_list` (one entry per placeholder, in encounter order across the
-    whole conversation) into a separate `images` list. Finally splits off the final
-    assistant turn as `completion`, with everything before it as `prompt`.
+    Shared tail used by `build_messages_qa` (flat QA/jsonl rows): walks
+    `conversations`, keeps `{"type": "image"}` placeholders in-place while decoding
+    the matching entry of the flat `image_bytes_list` (one entry per placeholder, in
+    encounter order across the whole conversation) into a separate `images` list.
+    Finally splits off the final assistant turn as `completion`, with everything
+    before it as `prompt`.
     """
     messages = []
     images: List[Image.Image] = []
@@ -219,20 +152,17 @@ def build_messages_qa(
     image_root: str,
 ) -> Tuple[Optional[List[Dict]], Optional[List[Dict]], Optional[List[Image.Image]]]:
     """
-    Convert one JSONL "flat QA" row (e.g. `minecraft-vlp/*.jsonl`) into the same TRL
-    prompt/completion/images format as `build_messages`, but WITHOUT the
-    trajectory-specific history-window sampling: these rows are short, independent
-    multi-turn Q&A sessions about a small, fixed set of images (declared once in the
-    row's "image" field, referenced by whichever `{"type": "image"}` placeholder(s)
-    appear anywhere in `conversations`, in encounter order) rather than a long
-    sequential trajectory of (image, action) steps -- so there is no "history length"
-    to randomly truncate. Keeping the whole conversation also guarantees any image
-    placeholder (almost always in the first user turn) always stays inside the
-    resulting `prompt` instead of possibly being sliced away.
+    Convert one JSONL "flat QA" row (e.g. `minecraft-vlp/*.jsonl`) into TRL's
+    prompt/completion/images format: these rows are short, independent multi-turn
+    Q&A sessions about a small, fixed set of images (declared once in the row's
+    "image" field, referenced by whichever `{"type": "image"}` placeholder(s) appear
+    anywhere in `conversations`, in encounter order), so the whole conversation is
+    kept as-is (no history-window truncation needed). Keeping the whole conversation
+    also guarantees any image placeholder (almost always in the first user turn)
+    always stays inside the resulting `prompt` instead of possibly being sliced away.
 
     Args:
-        conversations: list of {role, content[{type, text/image}]}, same schema as
-            `build_messages`.
+        conversations: list of {role, content[{type, text/image}]}.
         image_paths: list of paths *relative to `image_root`* (as stored in the row's
             "image" field), one entry per `{"type": "image"}` placeholder in encounter
             order across the whole conversation.
@@ -272,11 +202,11 @@ def build_messages_text_only(conversations: list) -> Tuple[Optional[List[Dict]],
     for JARVIS-VLA's Stage I ("Minecraft world knowledge" text-only post-training --
     see `--text_only`/`--freeze_vision_tower`).
 
-    Unlike `build_messages`/`build_messages_qa`, this does NOT strip a leading
-    non-"user" turn: that stripping exists in those two to drop a stray artifact turn
-    seen in trajectory/VQA preprocessing, but here a leading turn is normally a
-    legitimate system prompt ("You are a helpful assistant...") that must be preserved
-    inside `prompt`, not discarded.
+    Unlike `build_messages_qa`, this does NOT strip a leading non-"user" turn: that
+    stripping exists there to drop a stray artifact turn seen in trajectory/VQA
+    preprocessing, but here a leading turn is normally a legitimate system prompt
+    ("You are a helpful assistant...") that must be preserved inside `prompt`, not
+    discarded.
 
     Returns `(prompt, completion)` -- no `images` list, since this data format never
     has any (see `_row_to_trl_sample`/`build_minecraft_dataset` for why the caller must
@@ -349,8 +279,6 @@ def _resolve_chat_template_kwargs(processor) -> Dict:
 def _row_to_trl_sample(
     sample: Dict,
     idx: int,
-    max_turns: int,
-    seed: int,
     data_format: str,
     image_root: Optional[str],
     text_only: bool = False,
@@ -368,11 +296,7 @@ def _row_to_trl_sample(
     `datasets.Dataset`/`IterableDataset`, and chaining `.map()` on `load_dataset(...)`'s
     return value preserves that (plus SFTTrainer/Accelerate's sharding).
 
-    For parquet rows, uses a *local* RNG keyed by the sample's stable "id" (not `idx`)
-    so process/worker sharding can't change a sample's history choice, and the global
-    `random` module state isn't mutated as a side effect.
-
-    `text_only=True` (Stage I) bypasses `build_messages`/`build_messages_qa` for
+    `text_only=True` (Stage I) bypasses `build_messages_qa` for
     `build_messages_text_only`, and the returned dict has NO "images" key at all --
     `SFTTrainer` picks its vision collator purely based on whether that key is
     *present*, so omitting it (not just leaving it empty) is what keeps Stage I on the
@@ -385,10 +309,7 @@ def _row_to_trl_sample(
     length-checked (`_exceeds_max_length`) -- otherwise `SFTConfig`'s raw-token-level
     truncation can land inside an image's placeholder-token block, and the VLM forward
     pass crashes with a tokens/features mismatch (observed for real on Qwen2-VL-7B).
-    For trajectory rows the fix is to trim the sampled history until it fits, instead
-    of dropping the row outright.
     """
-    sample_id = sample.get("id", idx)
     chat_template_kwargs = _resolve_chat_template_kwargs(processor)
     if text_only:
         prompt, completion = build_messages_text_only(conversations=sample["conversations"])
@@ -427,56 +348,21 @@ def _row_to_trl_sample(
             if _exceeds_max_length(processor, prompt, completion, images, max_seq_length, chat_template_kwargs):
                 return {"prompt": [], "completion": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
     else:
-        def _build(turns: int):
-            # Fresh rng per attempt so the drawn history length stays a pure function of
-            # (seed, sample_id, turns) -- i.e. identical on every rank, never dependent on
-            # how many attempts happened to run.
-            return build_messages(
-                conversations=sample["conversations"],
-                image_bytes_list=sample.get("image_bytes", []),
-                max_turns=turns,
-                rng=random.Random(f"{seed}-{sample_id}"),
-            )
-
-        prompt, completion, images = _build(max_turns)
-        if prompt is None:
-            return {"prompt": [], "completion": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
-
-        # Shrink the sampled history (dropping the OLDEST turns, and with them their
-        # images) until the sample fits, instead of discarding the row outright. This
-        # keeps the common parquet path 1:1 (one input row -> one training sample),
-        # reduces rank-to-rank differences in effective shard lengths, and recovers
-        # long-trajectory samples that used to be thrown away: only surplus history is
-        # trimmed, never the current step or its target action.
-        #
-        # This is complementary to, but distinct from, process sharding. The dataset
-        # returned by `build_minecraft_dataset` must remain UNSHARDED here; SFTTrainer /
-        # Accelerate performs process-level sharding exactly once when preparing the
-        # DataLoader. Manually calling `split_dataset_by_node` before that caused every
-        # rank's stream to be divided by world_size a second time (N/world_size^2), which
-        # was the actual cause of the deterministic step-53/105 exhaustion and mismatched
-        # NCCL collectives. Rare malformed or irreducibly oversized rows may still be
-        # filtered, so callers should keep a small margin below the theoretical epoch end.
-        if images and processor is not None and max_seq_length is not None:
-            turns = max_turns
-            while _exceeds_max_length(
-                processor, prompt, completion, images, max_seq_length, chat_template_kwargs
-            ):
-                if turns <= 0:
-                    # Even a single turn (current observation + its action) overflows, so
-                    # there is nothing left to trim -- drop as a last resort. Vanishingly
-                    # rare (one 640x360 frame is ~300 vision tokens), and unlike the
-                    # length-based dropping above it is not correlated with trajectory
-                    # length, so it does not systematically favour any particular rank.
-                    logger.warning(
-                        f"Sample {sample_id} exceeds max_seq_length={max_seq_length} even with a "
-                        "single turn; dropping it."
-                    )
-                    return {"prompt": [], "completion": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
-                turns -= 1
-                prompt, completion, images = _build(turns)
-                if prompt is None:
-                    return {"prompt": [], "completion": [], "images": [], "chat_template_kwargs": {}, "_keep": False}
+        # data_format == "parquet" with full_trajectory=False. `build_minecraft_dataset`
+        # rejects this combination before ever calling `.map()` (see its own validation),
+        # because the single-step random-history-window sampler that used to run here
+        # (`build_messages`) caused real Stage III checkpoints to collapse to always
+        # predicting `move(0,0)` (~99.5% of camera outputs): long runs of identical
+        # "walk straight" actions numerically dominated the loss when each training
+        # sample only targets ONE action. It was replaced by `--full_trajectory` (see
+        # `_build_full_trajectory` above), which trains on every assistant turn in a
+        # trajectory per sample instead of a single randomly-sampled one. This branch is
+        # therefore unreachable in practice; the assertion exists only as a defensive
+        # backstop in case a future caller invokes `_row_to_trl_sample` directly.
+        raise AssertionError(
+            "data_format='parquet' requires full_trajectory=True; "
+            "build_minecraft_dataset should have validated this before calling .map()."
+        )
     return {
         "prompt": prompt,
         "completion": completion,
@@ -588,12 +474,11 @@ def _default_image_root(data_path: Union[str, List[str]]) -> str:
     return first.rsplit("/", 1)[0]
 
 
-# Columns actually read anywhere downstream (`_row_to_trl_sample` / `build_messages` /
-# `build_messages_qa` / `build_messages_text_only`): the trajectory-id (used only to
-# seed the history-sampling RNG, falls back to the row index if absent), the
-# conversation itself, and the image path list. Everything else (`label`, `model`,
-# `datetime`, `source`, ...) is pure metadata never touched by training code.
-_USED_COLUMNS = {"id", "conversations", "image"}
+# Columns actually read anywhere downstream (`_row_to_trl_sample` / `build_messages_qa` /
+# `build_messages_text_only` / `_build_full_trajectory`): the conversation itself and
+# the image path list. Everything else (`id`, `label`, `model`, `datetime`, `source`,
+# ...) is pure metadata never touched by training code.
+_USED_COLUMNS = {"conversations", "image"}
 
 
 def _load_dataset_multi(builder_name: str, data_path: Union[str, List[str]], streaming: bool):
@@ -626,9 +511,7 @@ def _load_dataset_multi(builder_name: str, data_path: Union[str, List[str]], str
 
 def build_minecraft_dataset(
     data_path: Union[str, List[str]],
-    max_turns: int = 4,
     streaming: bool = False,
-    seed: int = 42,
     data_format: str = "auto",
     image_root: Optional[str] = None,
     text_only: bool = False,
@@ -647,13 +530,21 @@ def build_minecraft_dataset(
     Supports two on-disk layouts, auto-detected from `data_path`'s extension (override
     with `data_format=`):
       - "parquet" (e.g. `minecraft-text-action-dataset`): each row is one trajectory
-        (`conversations` + one `image_bytes` entry per turn pair). `build_messages`
-        randomly samples a suffix history window (`max_turns`), or (with
-        `full_trajectory=True`) `_build_full_trajectory` keeps the whole thing.
+        (`conversations` + one `image_bytes` entry per turn pair). REQUIRES
+        `full_trajectory=True` (see below) -- `_build_full_trajectory` keeps the whole
+        trajectory as the training sample.
       - "jsonl" (e.g. `minecraft-vlp`): each row is a short, independent Q&A session
         with an `image` field listing path(s) relative to `image_root` (default: the
         directory containing the jsonl file). `build_messages_qa` loads those on-the-fly
         via `fsspec` and keeps the whole (already-short) conversation.
+
+    `full_trajectory=False` with `data_format="parquet"` raises `ValueError`: an earlier
+    single-step random-history-window sampler (`build_messages`, since removed) trained
+    each sample on only ONE randomly-chosen action per trajectory, and real Stage III
+    checkpoints trained that way collapsed to always predicting `move(0,0)` (~99.5% of
+    camera outputs) because long runs of identical "walk straight" actions numerically
+    dominated the loss. `--full_trajectory` (training on every assistant turn in a
+    trajectory, not just one) replaced it and is now the only supported parquet path.
 
     `text_only=True` (Stage I, no images): routes every row through
     `build_messages_text_only` instead, and the resulting samples carry NO "images" key
@@ -686,6 +577,14 @@ def build_minecraft_dataset(
             "(e.g. minecraft-vlp/mc-qa-*.jsonl). Any image_bytes on these rows will be "
             "ignored."
         )
+    if data_format == "parquet" and not text_only and not full_trajectory:
+        raise ValueError(
+            "data_format='parquet' requires --full_trajectory. The old single-step "
+            "random-history-window sampler was removed after it caused real Stage III "
+            "checkpoints to collapse to always predicting move(0,0) (long runs of "
+            "identical actions dominated the loss when each sample only targets one "
+            "action). Pass --full_trajectory to train on every assistant turn instead."
+        )
     if data_format == "jsonl" and image_root is None:
         image_root = _default_image_root(data_path)
 
@@ -708,8 +607,6 @@ def build_minecraft_dataset(
         _row_to_trl_sample,
         with_indices=True,
         fn_kwargs={
-            "max_turns": max_turns,
-            "seed": seed,
             "data_format": data_format,
             "image_root": image_root,
             "text_only": text_only,
